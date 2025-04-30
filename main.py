@@ -998,7 +998,7 @@ def background_process(task_id, pdf_path, excel_path, start_page, end_page, cont
         logging.info(f"Task {task_id}: Task completed successfully.")
 
         with progress_lock:
-            progress_data[task_id]['download_url'] = f"https://p5o8exb0s5dml8-5000.proxy.runpod.net/download/{final_filename}"
+            progress_data[task_id]['download_url'] = f"https://k14ofpt6ksgcjx-5000.proxy.runpod.net/download/{final_filename}"
 
     except Exception as e:
         logging.error(f"Error in background_process (task_id: {task_id}): {e}", exc_info=True)
