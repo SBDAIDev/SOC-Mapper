@@ -1,0 +1,34 @@
+# Ignore virtual environments
+venv/
+
+# Ignore Python bytecode/cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Ignore common Python backup files
+*.log
+*.pot
+*.pyc
+*.pyd
+*.pdb
+*.tmp
+*.old
+*.bak
+
+# VS Code settings (if applicable)
+.vscode/
+
+# Jupyter Notebook checkpoints (if using Jupyter)
+.ipynb_checkpoints/
+
+# Environment and dependency files
+.env
+*.env
+
+# Compiled C extensions
+*.so
+
+# Mac/Linux/Windows OS files
+.DS_Store
+Thumbs.db
