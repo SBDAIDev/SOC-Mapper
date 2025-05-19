@@ -9,6 +9,21 @@ from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from identifier import process_pdf as identify_control_ids
 
+# Import configuration and LLM utilities
+from config import (
+    UPLOAD_FOLDER,
+    RESULTS_FOLDER,
+    EXCEL_FOLDER,
+    RAG_OUTPUTS,
+    CHUNK_SIZE
+)
+from llm_utils import (
+    get_embedding,
+    batch_get_embeddings,
+    analyze_control_compliance,
+    analyze_qualifier
+)
+
 # Existing imports from your project
 from parser import (
     generate_regex_from_sample,
@@ -42,24 +57,21 @@ from openpyxl.utils import get_column_letter
 from werkzeug.utils import secure_filename
 
 import PyPDF2  # PDF processing
-from sentence_transformers import SentenceTransformer
+import numpy as np
 import faiss
 
-# New import for the complementary content module and Path
+# New import for the complementary content module
 import CUEC
-from pathlib import Path
 
 app = Flask(__name__)
 CORS(app)
 
-# --------------------------------------------------------
-# Configuration – updated paths to /Work/SOC-AI subfolders
-# --------------------------------------------------------
-app.config['UPLOAD_FOLDER'] = '/Work/SOC-AI/uploads'
-app.config['RESULTS_FOLDER'] = '/Work/SOC-AI/results'
-app.config['EXCEL_FOLDER'] = '/Work/SOC-AI/excel_outputs'
-app.config['RAG_OUTPUTS'] = '/Work/SOC-AI/rag_outputs'
-app.config['CHUNK_SIZE'] = 1000  # Large chunk size for better context
+# Use configuration from config.py
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['RESULTS_FOLDER'] = RESULTS_FOLDER
+app.config['EXCEL_FOLDER'] = EXCEL_FOLDER
+app.config['RAG_OUTPUTS'] = RAG_OUTPUTS
+app.config['CHUNK_SIZE'] = CHUNK_SIZE
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['RESULTS_FOLDER'], exist_ok=True)
@@ -1055,19 +1067,19 @@ def initial_qualifier_check():
         text_chunks = chunk_text_without_patterns(full_text, chunk_size)
         df_temp = pd.DataFrame({"Content": text_chunks})
 
-        model = SentenceTransformer('all-mpnet-base-v2')
-        embeddings = model.encode(df_temp["Content"].tolist(), show_progress_bar=False).astype('float32')
+        # Get embeddings for all chunks using OpenAI
+        embeddings = np.array(batch_get_embeddings(df_temp["Content"].tolist())).astype('float32')
         dimension = embeddings.shape[1]
         index = faiss.IndexFlatIP(dimension)
         index.add(embeddings)
 
-        latest_report_result = is_report_latest(df_temp, model, index, top_k=3)
-        trust_principles_result = are_trust_principles_covered(df_temp, model, index, top_k=3)
-        audit_period_result = is_audit_period_sufficient(df_temp, model, index, top_k=3)
-        invalid_observations_result = has_invalid_observations(df_temp, model, index, top_k=3)
-        report_qualified_result = is_report_qualified(df_temp, model, index, top_k=3)
+        latest_report_result = is_report_latest(df_temp, None, index, top_k=3)
+        trust_principles_result = are_trust_principles_covered(df_temp, None, index, top_k=3)
+        audit_period_result = is_audit_period_sufficient(df_temp, None, index, top_k=3)
+        invalid_observations_result = has_invalid_observations(df_temp, None, index, top_k=3)
+        report_qualified_result = is_report_qualified(df_temp, None, index, top_k=3)
 
-        scope_of_services_result = describe_scope_of_services(df_temp, model, index, top_k=3)
+        scope_of_services_result = describe_scope_of_services(df_temp, None, index, top_k=3)
         qualifiers = [
             {
                 "question": "Is the SOC 2 Type 2 Report latest (within the last 12 months)?",
@@ -1085,7 +1097,7 @@ def initial_qualifier_check():
                 "status": determine_status("Does the SOC 2 Type 2 Report cover an audit period of at least 9 months?", audit_period_result)
             },
             {
-                "question": "Are there any observations in the independent auditor’s opinion that signify the report is invalid?",
+                "question": "Are there any observations in the independent auditor's opinion that signify the report is invalid?",
                 "answer": invalid_observations_result,
                 "status": determine_status("Are there invalid observations?", invalid_observations_result)
             },
@@ -1096,7 +1108,7 @@ def initial_qualifier_check():
             }
         ]
 
-        scope_of_services_result = describe_scope_of_services(df_temp, model, index, top_k=3)
+        scope_of_services_result = describe_scope_of_services(df_temp, None, index, top_k=3)
         qualifiers.append({
             "question": "Please detail the scope of services within the SOC 2 Type 2 Report.",
             "answer": scope_of_services_result,

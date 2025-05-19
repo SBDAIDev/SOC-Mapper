@@ -8,6 +8,7 @@ from sentence_transformers import SentenceTransformer
 import faiss
 from tqdm import tqdm
 import re
+from llm_utils import batch_get_embeddings, analyze_control_compliance
 
 # If parser.py is in the same folder, make sure to reference it correctly
 from parser import (
@@ -102,42 +103,44 @@ def chunk_text_without_patterns(text, chunk_size=1000):
     logger.info("Chunking text without patterns.")
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
-def build_rag_system_with_parser(
-    pdf_path,
-    start_page,
-    end_page,
-    control_patterns,
-    output_text_path,
-    df_chunks_path,
-    faiss_index_path,
-    chunk_size=1000
-):
+def build_rag_system_with_parser(pdf_path, start_page, end_page, control_patterns,
+                               output_text_path, df_chunks_path, faiss_index_path, chunk_size):
     """
-    Extract text from a PDF, chunk it (with or without patterns),
-    generate embeddings, and build the FAISS index.
+    Build a RAG system using OpenAI embeddings.
     """
-    logger.info("Building RAG system with parser.")
-    text = extract_text_from_pdf(pdf_path, start_page, end_page, output_text_path)
-    
-    # Decide how to chunk
-    if control_patterns:
-        logger.info("Using pattern-based chunking for controls.")
-        df_chunks = chunk_text_by_multiple_patterns(text, control_patterns)
-    else:
-        logger.info("Using fixed-size chunking for qualifiers.")
-        chunks = chunk_text_without_patterns(text, chunk_size)
-        df_chunks = pd.DataFrame({"Content": chunks})
-    
-    # Generate embeddings & save them
-    df_chunks, model = generate_embeddings(df_chunks)
-    save_chunks_dataframe(df_chunks, df_chunks_path)
-
-    # Build the FAISS index & save
-    index, _ = create_faiss_index(df_chunks)
-    save_faiss_index(index, faiss_index_path)
-    
-    logger.info("RAG system built successfully with parser.")
-    return model
+    try:
+        # Extract text from PDF
+        extracted_text = extract_text_from_pdf(pdf_path, start_page, end_page, output_text_path)
+        
+        # Create chunks based on control patterns
+        if control_patterns:
+            df_chunks = chunk_text_by_multiple_patterns(extracted_text, control_patterns)
+        else:
+            # If no control patterns provided, chunk by size
+            chunks = [extracted_text[i:i+chunk_size] for i in range(0, len(extracted_text), chunk_size)]
+            df_chunks = pd.DataFrame({"Content": chunks})
+        
+        # Save chunks to CSV
+        df_chunks.to_csv(df_chunks_path, index=False)
+        
+        # Get embeddings for all chunks
+        texts = df_chunks["Content"].tolist()
+        embeddings = np.array(batch_get_embeddings(texts)).astype('float32')
+        
+        # Build FAISS index
+        dimension = embeddings.shape[1]
+        index = faiss.IndexFlatIP(dimension)
+        index.add(embeddings)
+        
+        # Save FAISS index
+        faiss.write_index(index, faiss_index_path)
+        
+        logging.info(f"RAG system built successfully. Index saved to {faiss_index_path}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error building RAG system: {e}", exc_info=True)
+        raise
 
 def retrieve_answers_for_controls(
     df,
@@ -198,39 +201,55 @@ def retrieve_answers_for_controls(
     logger.info("Answers retrieved for all controls.")
     return df
 
-def process_cybersecurity_framework_with_rag(
-    excel_input_path,
-    output_path,
-    faiss_index_path,
-    df_chunks_path,
-    top_k=3
-):
+def process_cybersecurity_framework_with_rag(excel_input_path, output_path, faiss_index_path,
+                                           df_chunks_path, top_k=3):
     """
-    Load an Excel with 'Domain', 'Sub-Domain', 'Control' columns.
-    Generate answers for each control, and save an updated file.
+    Process cybersecurity framework using RAG system with OpenAI embeddings.
     """
-    logger.info("Processing cybersecurity framework with RAG.")
-    df = pd.read_excel(excel_input_path)
-    required_columns = {'Domain', 'Sub-Domain', 'Control'}
-    if not required_columns.issubset(df.columns):
-        logger.error("Input Excel file missing required columns.")
-        raise ValueError(f"Input Excel file must contain columns: {required_columns}")
-    
-    # This function concatenates 'Sub-Domain' and 'Control' -> 'Domain_Control'
-    df = concatenate_domain_control(df)
-
-    # Load model & index, plus chunk DataFrame
-    model = SentenceTransformer('all-mpnet-base-v2')
-    index = load_faiss_index(faiss_index_path)
-    df_chunks = load_chunks_dataframe(df_chunks_path)
-
-    # Retrieve answers
-    df = retrieve_answers_for_controls(df, model, index, df_chunks, top_k=top_k)
-
-    # Save updated DataFrame
-    save_updated_framework(df, output_path)
-    logger.info("Cybersecurity framework processed with RAG successfully.")
-    return df
+    try:
+        # Load the framework Excel file
+        df = pd.read_excel(excel_input_path)
+        
+        # Load chunks and FAISS index
+        df_chunks = pd.read_csv(df_chunks_path)
+        index = faiss.read_index(faiss_index_path)
+        
+        results = []
+        for _, row in df.iterrows():
+            # Get control text
+            control_text = str(row['User Org Control Statement'])
+            
+            # Get embedding for the control
+            control_embedding = np.array([batch_get_embeddings([control_text])[0]]).astype('float32')
+            
+            # Search similar contexts
+            D, I = index.search(control_embedding, top_k)
+            
+            # Get relevant chunks
+            relevant_chunks = df_chunks.iloc[I[0]]['Content'].tolist()
+            context = "\n".join(relevant_chunks)
+            
+            # Analyze compliance using GPT-4
+            analysis = analyze_control_compliance(control_text, context)
+            
+            # Store results
+            results.append({
+                'Control': control_text,
+                'Analysis': analysis,
+                'Context': context
+            })
+        
+        # Create output DataFrame
+        output_df = pd.DataFrame(results)
+        
+        # Save to Excel
+        output_df.to_excel(output_path, index=False)
+        logging.info(f"Framework processed successfully. Results saved to {output_path}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error processing framework: {e}", exc_info=True)
+        raise
 
 def save_updated_framework(df, output_path):
     """

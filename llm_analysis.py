@@ -14,6 +14,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.utils import column_index_from_string
+from llm_utils import analyze_control_compliance
 
 # Configure logging with enhanced setup
 logging.basicConfig(
@@ -96,18 +97,16 @@ def call_ollama_api(prompt, model=PHI4_MODEL_NAME, max_tokens=MAX_TOKENS):
         logger.error(f"Unexpected error during API response processing: {e}")
         raise
 
-def load_responses(responses_path):
+def load_responses(excel_path):
     """
-    Loads the responses from the given Excel file.
+    Load responses from the processed framework Excel file.
     """
-    logger.info(f"Loading responses from {responses_path}")
     try:
-        df = pd.read_excel(responses_path)
-        logger.info(f"Responses file '{responses_path}' loaded successfully.")
+        df = pd.read_excel(excel_path)
         return df
     except Exception as e:
-        logger.error(f"Failed to load responses file '{responses_path}': {e}")
-        raise e
+        logging.error(f"Error loading responses from {excel_path}: {e}")
+        raise
 
 def generate_analysis_prompt(control_description, answers):
     """
@@ -309,99 +308,46 @@ def determine_final_conclusion(assessments):
     else:
         return 'Not Met'
 
-def process_controls(df, top_k=3, max_retries=1, socketio=None):
+def process_controls(df):
     """
-    Processes each control by generating prompts, calling the LLM using the fixed phi4 model,
-    cleaning the output, and updating the DataFrame with analysis.
+    Process each control using OpenAI's GPT-4 model.
     """
-    logger.info("Processing controls with LLM analysis using model phi4.")
-
-    for i in range(1, top_k + 1):
-        if f'Answer_{i}' not in df.columns:
-            df[f'Answer_{i}'] = ''
-        if f'Answer_{i}_Control_ID' not in df.columns:
-            df[f'Answer_{i}_Control_ID'] = ''
-
-    df['Control Status'] = ''
-    df['Explanation'] = ''
-    df['Final Conclusion'] = ''
-
-    total_controls = df.shape[0]
-    for idx, row in tqdm(df.iterrows(), total=total_controls, desc="Processing Controls"):
-        control_description = row['Control']
-        answers = []
-
-        for k in range(1, top_k + 1):
-            answer_text = row.get(f'Answer_{k}', '')
-            answer_control_id = row.get(f'Answer_{k}_Control_ID', '')
-            if pd.notna(answer_text) and str(answer_text).strip():
-                answers.append({'text': str(answer_text).strip(), 'control_id': str(answer_control_id).strip()})
-
-        if not answers:
-            logger.warning(f"No valid answers found for control at index {idx}. Skipping.")
-            df.at[idx, 'Control Status'] = 'Not Met'
-            df.at[idx, 'Explanation'] = 'No valid responses provided.'
-            df.at[idx, 'Final Conclusion'] = 'Not Met'
-            if socketio:
-                progress = ((idx + 1) / total_controls) * 100
-                socketio.emit('progress', {'progress': progress}, broadcast=True)
-            continue
-
-        prompt = generate_analysis_prompt(control_description, answers)
-        retries = 0
-        while retries <= max_retries:
-            try:
-                response = call_ollama_api(prompt)
-                cleaned_response, individual_statuses, final_conclusion_from_llm = clean_llm_output(
-                    response,
-                    control_description
-                )
-
-                if individual_statuses:
-                    final_conclusion = determine_final_conclusion(individual_statuses)
-                elif final_conclusion_from_llm:
-                    final_conclusion = final_conclusion_from_llm
-                else:
-                    final_conclusion = 'Error in Analysis'
-
-                df.at[idx, 'Control Status'] = final_conclusion
-                df.at[idx, 'Explanation'] = cleaned_response if cleaned_response else final_conclusion_from_llm
-                df.at[idx, 'Final Conclusion'] = final_conclusion
-
-                if socketio:
-                    progress = ((idx + 1) / total_controls) * 100
-                    socketio.emit('progress', {'progress': progress}, broadcast=True)
-                break
-
-            except ValueError as ve:
-                logger.error(f"Processing error at index {idx}: {ve}")
-                retries += 1
-                if retries > max_retries:
-                    logger.error(f"Max retries exceeded for control at index {idx}. Marking as 'Error'.")
-                    df.at[idx, 'Control Status'] = 'Error'
-                    df.at[idx, 'Explanation'] = f"Error: {ve}"
-                    df.at[idx, 'Final Conclusion'] = 'Error in Analysis'
-                    if socketio:
-                        progress = ((idx + 1) / total_controls) * 100
-                        socketio.emit('progress', {'progress': progress}, broadcast=True)
-                else:
-                    logger.info(f"Retrying control at index {idx} (Attempt {retries}/{max_retries}) due to missing final conclusion...")
-            except Exception as e:
-                logger.error(f"Unexpected error at index {idx}: {e}")
-                retries += 1
-                if retries > max_retries:
-                    logger.error(f"Max retries exceeded for control at index {idx}. Marking as 'Error'.")
-                    df.at[idx, 'Control Status'] = 'Error'
-                    df.at[idx, 'Explanation'] = f"Error: {e}"
-                    df.at[idx, 'Final Conclusion'] = 'Error in Analysis'
-                    if socketio:
-                        progress = ((idx + 1) / total_controls) * 100
-                        socketio.emit('progress', {'progress': progress}, broadcast=True)
-                else:
-                    logger.info(f"Retrying control at index {idx} due to unexpected error (Attempt {retries}/{max_retries})...")
-
-    logger.info("LLM analysis completed for all controls.")
-    return df
+    try:
+        results = []
+        for _, row in df.iterrows():
+            control = row['Control']
+            context = row['Context']
+            
+            # Get analysis from GPT-4
+            analysis = analyze_control_compliance(control, context)
+            
+            # Parse the analysis to extract score and status
+            score = None
+            status = None
+            detailed_analysis = analysis
+            
+            # Simple parsing (you might want to make this more robust)
+            lines = analysis.split('\n')
+            for line in lines:
+                if line.startswith('1.') and 'Score' in line:
+                    try:
+                        score = int(line.split(':')[-1].strip().rstrip('%'))
+                    except:
+                        score = 0
+                elif line.startswith('3.') and 'Status' in line:
+                    status = line.split(':')[-1].strip()
+            
+            results.append({
+                'Control': control,
+                'Compliance Score': score,
+                'Control Status': status,
+                'Detailed Analysis': detailed_analysis
+            })
+        
+        return pd.DataFrame(results)
+    except Exception as e:
+        logging.error(f"Error processing controls: {e}")
+        raise
 
 def process_final_conclusions(df, max_retries=1, socketio=None):
     """
@@ -463,261 +409,85 @@ def process_final_conclusions(df, max_retries=1, socketio=None):
     logger.info("Final conclusions processed for all controls.")
     return df
 
-def load_excel_file(file_path, sheet_name=0):
-    """
-    Loads the Excel file from the given path.
-    """
-    logger.info(f"Loading Excel file from {file_path}")
+def load_excel_file(file_path):
+    """Load Excel file into DataFrame."""
     try:
-        df = pd.read_excel(file_path, sheet_name=sheet_name)
-        logger.info("Framework file loaded successfully.")
-        return df
+        return pd.read_excel(file_path)
     except Exception as e:
-        logger.error(f"Error loading Excel file: {e}")
-        raise e
+        logging.error(f"Error loading Excel file {file_path}: {e}")
+        raise
 
-def map_columns_by_position(framework_df):
-    """
-    Maps columns by their position to expected column names.
-    """
-    logger.info("Mapping columns by position in the framework file.")
-    expected_columns = ['User Org Control Domain', 'User Org Control Sub-Domain', 'User Org Control Statement']
-    actual_columns = framework_df.columns.tolist()
-
-    if len(actual_columns) < 3:
-        err_msg = f"Error: Expected at least 3 columns in the framework file, found {len(actual_columns)}."
-        logger.error(err_msg)
-        return None, err_msg
-
-    framework_df = framework_df.rename(columns={
-        actual_columns[0]: expected_columns[0],
-        actual_columns[1]: expected_columns[1],
-        actual_columns[2]: expected_columns[2]
-    })
-
-    if len(actual_columns) > 3:
-        framework_df = framework_df[expected_columns]
-
-    logger.info("Columns mapped successfully.")
-    return framework_df, None
+def map_columns_by_position(df):
+    """Map DataFrame columns based on position."""
+    try:
+        required_columns = [
+            'Sr. No.',
+            'User Org Control Domain',
+            'User Org Control Sub-Domain',
+            'User Org Control Statement'
+        ]
+        
+        if len(df.columns) < len(required_columns):
+            return None, "Not enough columns in the framework file"
+        
+        df.columns = required_columns + list(df.columns[len(required_columns):])
+        return df, None
+    except Exception as e:
+        return None, str(e)
 
 def merge_dataframes(framework_df, analysis_df):
-    """
-    Merges the framework DataFrame with the analysis DataFrame.
-    """
-    logger.info("Merging framework DataFrame with analysis DataFrame.")
-    merged_df = pd.merge(
-        framework_df,
-        analysis_df,
-        how='left',
-        left_on='User Org Control Statement',
-        right_on='Control'
-    )
-    logger.info("DataFrames merged successfully.")
-    return merged_df
-
-def create_final_dataframe(merged_df, top_k=3):
-    """
-    Creates the final DataFrame with all required columns, renames columns, adds Compliance Score,
-    and reorders them as specified.
-    """
-    logger.info("Creating final DataFrame for output.")
-
-    if 'Explanation' in merged_df.columns:
-        merged_df = merged_df.rename(columns={'Explanation': 'Detailed Analysis Explanation'})
-    else:
-        merged_df['Detailed Analysis Explanation'] = ""
-
-    if 'Control Status' in merged_df.columns:
-        merged_df['Control Status'] = merged_df['Control Status'].fillna('Not Met')
-    else:
-        merged_df['Control Status'] = 'Not Met'
-
-    merged_df = merged_df.reset_index(drop=True)
-    merged_df.insert(0, 'Sr. No.', merged_df.index + 1)
-
-    def merge_controls(row):
-        controls = []
-        for i in range(1, top_k + 1):
-            answer = row.get(f'Answer_{i}', '')
-            if pd.notna(answer):
-                answer_str = str(answer).strip()
-                if answer_str:
-                    controls.append(answer_str)
-        return '\n'.join(controls)
-
-    merged_df['Service Org Controls'] = merged_df.apply(merge_controls, axis=1)
-
-    def merge_control_ids(row):
-        ids = []
-        for i in range(1, top_k + 1):
-            cid = row.get(f'Answer_{i}_Control_ID', '')
-            if pd.notna(cid):
-                cid_str = str(cid).strip()
-                if cid_str:
-                    ids.append(cid_str)
-        return '\n'.join(ids)
-
-    merged_df['Service Org Control IDs'] = merged_df.apply(merge_control_ids, axis=1)
-
-    status_to_score = {
-        'Fully Met': 100,
-        'Partially Met': 50,
-        'Not Met': 0,
-        'Error in Analysis': 0
-    }
-    merged_df['Compliance Score'] = merged_df['Control Status'].map(status_to_score).fillna(0)
-
-    final_columns = [
-        'Sr. No.',
-        'User Org Control Domain',
-        'User Org Control Sub-Domain',
-        'User Org Control Statement',
-        'Service Org Control IDs',
-        'Service Org Controls',
-        'Compliance Score',
-        'Detailed Analysis Explanation',
-        'Control Status'
-    ]
-
-    missing_final_columns = set(final_columns) - set(merged_df.columns)
-    if missing_final_columns:
-        err_msg = f"Error: Missing columns {missing_final_columns} after merging."
-        logger.error(err_msg)
-        return None, err_msg
-
-    final_df = merged_df[final_columns]
-    logger.info("Final DataFrame created successfully.")
-    return final_df, None
-
-def remove_not_met_controls(df, explanation_column="Explanation"):
-    """
-    Cleans "Not Met" controls in the dataframe.
-    """
-    for idx, row in df.iterrows():
-        explanation = row.get(explanation_column, "")
-        if pd.isna(explanation) or not str(explanation).strip():
-            continue
-
-        control_analyses = re.split(r'\n*Per review of\s+', explanation)
-        control_analyses = [ca.strip() for ca in control_analyses if ca.strip()]
-        retained_analyses = []
-
-        for i, ca in enumerate(control_analyses, 1):
-            ca_full = f"Per review of {ca}"
-            if "is Not Met" in ca_full:
-                answer_col = f"Answer_{i}"
-                control_col = f"{answer_col}_Control_ID"
-                if answer_col in df.columns and control_col in df.columns:
-                    df.at[idx, answer_col] = ""
-                    df.at[idx, control_col] = ""
-                    logger.info(f"Cleared {answer_col} and {control_col} for control at index {idx} due to 'Not Met'.")
-                else:
-                    logger.warning(f"Columns {answer_col} or {control_col} not found in DataFrame for index {idx}.")
-            else:
-                retained_analyses.append(ca_full)
-
-        df.at[idx, explanation_column] = "\n\n".join(retained_analyses)
-
-    return df
-
-def save_to_excel(df, output_path, top_k=3):
-    """
-    Saves the final DataFrame to an Excel file with appropriate formatting.
-    """
-    logger.info(f"Saving final DataFrame to Excel at {output_path}")
-
+    """Merge framework and analysis DataFrames."""
     try:
-        df = remove_not_met_controls(df, explanation_column="Detailed Analysis Explanation")
-
-        if 'Detailed Analysis Explanation' in df.columns:
-            fully_met_mask = df['Detailed Analysis Explanation'].str.contains('Fully Met', case=False, na=False)
-            num_fully_met = fully_met_mask.sum()
-
-            if num_fully_met > 0:
-                logger.info(f"Found 'Fully Met' in 'Detailed Analysis Explanation' for {num_fully_met} controls.")
-                df.loc[fully_met_mask, 'Control Status'] = 'Fully Met'
-            else:
-                logger.info("No instances of 'Fully Met' found in 'Detailed Analysis Explanation'.")
-        else:
-            logger.warning("'Detailed Analysis Explanation' column not found in DataFrame.")
-
-        status_to_score = {
-            'Fully Met': 100,
-            'Partially Met': 50,
-            'Not Met': 0,
-            'Error in Analysis': 0
-        }
-        df['Compliance Score'] = df['Control Status'].map(status_to_score).fillna(0)
-        logger.info("'Compliance Score' updated based on 'Control Status'.")
-
-        df.to_excel(output_path, index=False)
-        logger.info(f"DataFrame successfully saved to '{output_path}'.")
-
-        wb = load_workbook(output_path)
-        ws = wb.active
-
-        thin = Side(border_style="thin", color="000000")
-        border = Border(top=thin, left=thin, right=thin, bottom=thin)
-        bold_font = Font(bold=True)
-        wrap_alignment = Alignment(wrap_text=True, vertical='top')
-        header_fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")
-
-        for cell in ws[1]:
-            cell.font = bold_font
-            cell.fill = header_fill
-            cell.border = border
-            cell.alignment = wrap_alignment
-
-        for row in ws.iter_rows(min_row=2):
-            for cell in row:
-                cell.border = border
-                cell.alignment = wrap_alignment
-
-        control_status_col = None
-        for cell in ws[1]:
-            if cell.value == 'Control Status':
-                control_status_col = cell.column_letter
-                break
-
-        if control_status_col:
-            red_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
-            yellow_fill = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
-            green_fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
-
-            ws.conditional_formatting.add(
-                f'{control_status_col}2:{control_status_col}{ws.max_row}',
-                CellIsRule(operator='equal', formula=['"Not Met"'], fill=red_fill)
-            )
-            ws.conditional_formatting.add(
-                f'{control_status_col}2:{control_status_col}{ws.max_row}',
-                CellIsRule(operator='equal', formula=['"Partially Met"'], fill=yellow_fill)
-            )
-            ws.conditional_formatting.add(
-                f'{control_status_col}2:{control_status_col}{ws.max_row}',
-                CellIsRule(operator='equal', formula=['"Fully Met"'], fill=green_fill)
-            )
-            logger.info("Conditional formatting applied based on 'Control Status'.")
-        else:
-            logger.warning("Could not find 'Control Status' column for conditional formatting.")
-
-        for col in ws.columns:
-            header_cell = col[0]
-            if header_cell.value:
-                header_length = len(str(header_cell.value))
-                adjusted_width = header_length + 2
-                column_letter = header_cell.column_letter
-                ws.column_dimensions[column_letter].width = adjusted_width
-            else:
-                column_letter = col[0].column_letter
-                ws.column_dimensions[column_letter].width = 15
-
-        wb.save(output_path)
-        logger.info(f"Final Excel file saved with requested formatting to '{output_path}'.")
-
+        return pd.merge(
+            framework_df,
+            analysis_df,
+            left_on='User Org Control Statement',
+            right_on='Control',
+            how='left'
+        )
     except Exception as e:
-        logger.error(f"Error saving the Excel file with formatting: {e}")
-        raise e
+        logging.error(f"Error merging DataFrames: {e}")
+        raise
+
+def create_final_dataframe(merged_df):
+    """Create final DataFrame with required columns."""
+    try:
+        final_columns = [
+            'Sr. No.',
+            'User Org Control Domain',
+            'User Org Control Sub-Domain',
+            'User Org Control Statement',
+            'Service Org Control IDs',
+            'Service Org Controls',
+            'Compliance Score',
+            'Detailed Analysis',
+            'Control Status'
+        ]
+        
+        # Initialize empty columns if they don't exist
+        for col in final_columns:
+            if col not in merged_df.columns:
+                merged_df[col] = None
+        
+        return merged_df[final_columns], None
+    except Exception as e:
+        return None, str(e)
+
+def remove_not_met_controls(df):
+    """Remove controls with 'Not Met' status."""
+    try:
+        return df[df['Control Status'] != 'Not Met']
+    except Exception as e:
+        logging.error(f"Error removing Not Met controls: {e}")
+        raise
+
+def save_to_excel(df, output_path):
+    """Save DataFrame to Excel."""
+    try:
+        df.to_excel(output_path, index=False)
+    except Exception as e:
+        logging.error(f"Error saving to Excel {output_path}: {e}")
+        raise
 
 # Example usage (You can remove or comment out this part if integrating into a larger system)
 if __name__ == "__main__":
@@ -739,15 +509,15 @@ if __name__ == "__main__":
 
         analysis_df = load_responses(args.responses)
         merged_df = merge_dataframes(framework_df, analysis_df)
-        final_df, error = create_final_dataframe(merged_df, top_k=args.top_k)
+        final_df, error = create_final_dataframe(merged_df)
         if error:
             logger.error(error)
             exit(1)
 
-        processed_df = process_controls(final_df, top_k=args.top_k)
+        processed_df = process_controls(final_df)
         processed_df = process_final_conclusions(processed_df)
 
-        save_to_excel(processed_df, args.output, top_k=args.top_k)
+        save_to_excel(processed_df, args.output)
 
         logger.info("LLM Analysis completed successfully.")
 
